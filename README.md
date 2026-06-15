@@ -53,3 +53,45 @@ var API_BASE='https://trendo-backend.onrender.com';
 Listo: con eso el modo "Tengo el link" consulta el backend y, al **calificar/finalizar**, llega el correo a `ceo@protipark.com` con todo el formulario en JSON.
 
 Si dejas `API_BASE=''`, la app sigue funcionando (estimacion local, Excel y WhatsApp), solo no envia el correo automatico.
+
+---
+
+## 5. Validar que TODO funciona (pruebas)
+
+Haz estas pruebas en orden. Cada una aisla un problema.
+
+**Prueba 1 — el servidor vive**
+Abre en el navegador: `https://trendo-46m6.onrender.com/api/health`
+Debe responder algo como `{"ok":true,"service":"trendo-backend","scraper":false,"mailTo":"ceo@protipark.com"}`.
+- Si tarda ~30–50s la primera vez: normal (plan free de Render "despierta").
+- Si no abre: el servicio no esta desplegado o esta caido (revisa Render → Logs).
+
+**Prueba 2 — el correo (la mas importante para tu caso)**
+Abre: `https://trendo-46m6.onrender.com/api/test-mail`
+- Si responde `{"ok":true,...}` → revisa la bandeja de `ceo@protipark.com` (y SPAM). El correo funciona.
+- Si responde `{"ok":false,"error":"..."}` → ESE mensaje es la causa. Los típicos:
+  - `Invalid login` / `Username and Password not accepted` → el `SMTP_PASS` no es un **App Password** (con Gmail hay que crear uno; la clave normal no sirve).
+  - `self signed certificate` / puerto → revisa `SMTP_PORT=465` y `SMTP_SECURE=true`.
+  - `Missing credentials` → faltan variables `SMTP_*` en Render.
+
+**Prueba 3 — desde la página real**
+Abre tu link de GitHub Pages, llena una cotización, califica y finaliza.
+- En la última pantalla debe decir **"Cotizacion enviada a Trendo (correo OK)"**.
+- Si dice "No se pudo enviar el correo": el backend respondió error → repite la Prueba 2 para ver el detalle, o mira Render → Logs (verás `LEAD recibido ...` y `lead mail ERROR ...`).
+
+**Prueba 4 — lectura de link (si activaste SCRAPER_API_KEY)**
+El backend ya recibe el POST de `/api/analyze`; en Render → Logs verás `analyze Alibaba imanes ...`.
+Sin `SCRAPER_API_KEY` la lectura es heurística (estimada). Con la key, intenta render real.
+
+### Por qué quizá no llegó el correo (causas más comunes)
+1. Variables `SMTP_*` no están puestas en Render (solo en tu `.env` local no basta; hay que ponerlas en Render → Environment).
+2. `SMTP_PASS` es la clave normal y no un App Password.
+3. El correo llegó a **SPAM** (revisa esa carpeta).
+4. El servicio estaba dormido y el primer intento se perdió (haz la Prueba 2 dos veces).
+
+## 6. Sobre leer Alibaba "como lo hace el agente"
+Leer precio/variantes/peso reales de Alibaba de forma confiable necesita renderizar JavaScript y saltar el anti-bot. Opciones, de menor a mayor fiabilidad:
+- **ScraperAPI / ScrapingBee** (render=true): pones `SCRAPER_API_KEY` y el backend ya lo usa. Económico, pero a veces Alibaba bloquea igual.
+- **API de datos de producto** (RapidAPI tiene "Alibaba/AliExpress product data"): devuelve JSON con precio, MOQ, specs. Lo más confiable; requiere adaptar `parsePrice` al formato de esa API.
+- **Agente con navegador + IA** (como la demo): lo más potente y lo más caro de operar.
+Dinos cuál prefieres y lo cableamos en `/api/analyze`.
