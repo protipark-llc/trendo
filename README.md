@@ -95,3 +95,26 @@ Leer precio/variantes/peso reales de Alibaba de forma confiable necesita renderi
 - **API de datos de producto** (RapidAPI tiene "Alibaba/AliExpress product data"): devuelve JSON con precio, MOQ, specs. Lo más confiable; requiere adaptar `parsePrice` al formato de esa API.
 - **Agente con navegador + IA** (como la demo): lo más potente y lo más caro de operar.
 Dinos cuál prefieres y lo cableamos en `/api/analyze`.
+
+---
+
+## 7. Si el test-mail da "Connection timeout" (caso Render + Gmail)
+
+Significa que Render no logra abrir la conexion SMTP saliente (en hosting gratis es comun que el puerto 465 quede bloqueado). Dos arreglos:
+
+**Arreglo A (rapido, gratis, sin registrarse): probar puerto 587**
+En Render → Environment cambia:
+- `SMTP_PORT` = `587`
+- `SMTP_SECURE` = `false`
+Guarda (redepliega solo) y vuelve a abrir `/api/test-mail`.
+Si responde `{"ok":true,...}` → resuelto.
+
+**Arreglo B (el mas confiable: correo por HTTP con Resend)**
+Si el 587 tambien da timeout, Render esta bloqueando SMTP. Usa Resend, que envia por HTTPS (puerto 443, nunca bloqueado):
+1. Crea cuenta gratis en **resend.com** (plan free: 3.000 correos/mes).
+2. Ve a **API Keys** → crea una y copiala.
+3. En Render → Environment agrega `RESEND_API_KEY` con esa key.
+4. (Opcional) Para que el remitente sea tu dominio, verifica `protipark.com` en Resend y deja `MAIL_FROM=Trendo <no-reply@protipark.com>`. Mientras tanto, para probar puedes usar `MAIL_FROM=Trendo <onboarding@resend.dev>`.
+5. Guarda y abre `/api/test-mail` → debe decir `"via":"resend"` y `ok:true`.
+
+El backend ya soporta ambos: si `RESEND_API_KEY` esta puesta, usa Resend; si no, usa el SMTP.

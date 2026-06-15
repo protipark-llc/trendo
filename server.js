@@ -86,18 +86,15 @@ function parsePrice($, html){
   return null;
 }
 
-app.get('/api/health', (_q,res)=> res.json({ ok:true, service:'trendo-backend', scraper: !!process.env.SCRAPER_API_KEY, mailTo: MAIL_TO }));
+app.get('/api/health', (_q,res)=> res.json({ ok:true, service:'trendo-backend', emailVia: process.env.RESEND_API_KEY?'resend':'smtp', scraper: !!process.env.SCRAPER_API_KEY, mailTo: MAIL_TO }));
 
 app.get('/api/test-mail', async (_q,res)=>{
   try{
-    const info = await mailer().sendMail({
-      from: process.env.MAIL_FROM || 'Trendo <no-reply@protipark.com>',
-      to: MAIL_TO, subject: 'Prueba de correo Trendo (OK)',
-      text: 'Si lees esto, el correo del cotizador Trendo funciona.',
-      html: '<b>Funciona</b> el correo del cotizador Trendo. (prueba)'
-    });
-    console.log('test-mail enviado', info.messageId);
-    res.json({ ok:true, sentTo: MAIL_TO, messageId: info.messageId });
+    const info = await sendEmail({ subject:'Prueba de correo Trendo (OK)',
+      text:'Si lees esto, el correo del cotizador Trendo funciona.',
+      html:'<b>Funciona</b> el correo del cotizador Trendo. (prueba)' });
+    console.log('test-mail enviado', info.via, info.messageId);
+    res.json({ ok:true, sentTo: MAIL_TO, via: info.via, messageId: info.messageId });
   }catch(e){ console.error('test-mail ERROR', e.message); res.status(500).json({ ok:false, error:e.message }); }
 });
 
@@ -132,12 +129,28 @@ app.post('/api/analyze', async (req,res)=>{
 let transporter=null;
 function mailer(){
   if(transporter) return transporter;
+  const secure = String(process.env.SMTP_SECURE||'true')==='true';
   transporter = nodemailer.createTransport({
-    host: process.env.SMTP_HOST, port:+(process.env.SMTP_PORT||465),
-    secure: String(process.env.SMTP_SECURE||'true')==='true',
-    auth:{ user:process.env.SMTP_USER, pass:process.env.SMTP_PASS }
+    host: process.env.SMTP_HOST, port:+(process.env.SMTP_PORT||465), secure,
+    auth:{ user:process.env.SMTP_USER, pass:process.env.SMTP_PASS },
+    connectionTimeout: 15000, greetingTimeout: 10000, socketTimeout: 20000,
+    ...(secure ? {} : { requireTLS:true })
   });
   return transporter;
+}
+// Envia por Resend (HTTP, puerto 443: nunca lo bloquean) si hay RESEND_API_KEY; si no, por SMTP.
+async function sendEmail({subject, html, text}){
+  const from = process.env.MAIL_FROM || 'Trendo <onboarding@resend.dev>';
+  if(process.env.RESEND_API_KEY){
+    const r = await fetch('https://api.resend.com/emails', { method:'POST',
+      headers:{ 'Authorization':'Bearer '+process.env.RESEND_API_KEY, 'Content-Type':'application/json' },
+      body: JSON.stringify({ from, to:[MAIL_TO], subject, html, text }) });
+    const j = await r.json().catch(()=>({}));
+    if(!r.ok) throw new Error('Resend '+r.status+': '+(j.message||JSON.stringify(j)));
+    return { messageId:j.id, via:'resend' };
+  }
+  const info = await mailer().sendMail({ from, to:MAIL_TO, subject, html, text });
+  return { messageId:info.messageId, via:'smtp' };
 }
 
 app.post('/api/lead', async (req,res)=>{
@@ -155,12 +168,13 @@ app.post('/api/lead', async (req,res)=>{
     <p><b>Calificacion:</b> ${p.calificacion||'-'} · <b>Comentario:</b> ${p.comentario||'-'}</p>
     <hr><pre style="font-size:12px">${JSON.stringify(p,null,2)}</pre>`;
   try{
-    const info=await mailer().sendMail({ from: process.env.MAIL_FROM || 'Trendo <no-reply@protipark.com>', to: MAIL_TO, subject:`Cotizacion Trendo ${p.ref||''} — ${cli.nombre||'cliente'}`, html, text: JSON.stringify(p,null,2) });
-    res.json({ ok:true, ref:p.ref, messageId: info.messageId });
+    const info=await sendEmail({ subject:`Cotizacion Trendo ${p.ref||''} - ${cli.nombre||'cliente'}`, html, text: JSON.stringify(p,null,2) });
+    res.json({ ok:true, ref:p.ref, via: info.via, messageId: info.messageId });
   }catch(e){ console.error('lead mail ERROR', e.message); res.status(500).json({ ok:false, error:e.message }); }
 });
 
 app.listen(PORT, ()=>{
   console.log('trendo-backend en puerto '+PORT+' | scraper:'+(!!process.env.SCRAPER_API_KEY)+' | mailTo:'+MAIL_TO);
-  try{ mailer().verify().then(()=>console.log('SMTP OK: listo para enviar')).catch(e=>console.error('SMTP NO conecta:', e.message)); }catch(e){ console.error('SMTP config faltante:', e.message); }
+  if(process.env.RESEND_API_KEY){ console.log('Email via Resend (HTTP) - OK'); }
+  else { try{ mailer().verify().then(()=>console.log('SMTP OK: listo para enviar')).catch(e=>console.error('SMTP NO conecta:', e.message)); }catch(e){ console.error('SMTP config faltante:', e.message); } }
 });
