@@ -101,15 +101,27 @@ app.get('/api/test-mail', async (_q,res)=>{
 // extrae source + id de producto del URL (Alibaba .../_1601455645588.html, AliExpress /item/100500xxx.html, etc.)
 function extractInfo(url){
   const source = detectSrc(url.toLowerCase());
-  let id=null, m = url.match(/(\d{8,})\.html/) || url.match(/\/(\d{8,})(?:[\/?\.]|$)/) || url.match(/[?&](?:id|itemId|productId)=(\d{6,})/i);
+  let id=null, m = url.match(/(\d{8,})\.html/) || url.match(/made-in-china\.com\/product\/([A-Za-z0-9_-]{6,})/i) || url.match(/\/(\d{8,})(?:[\/?\.]|$)/) || url.match(/[?&](?:id|itemId|productId)=([A-Za-z0-9]{6,})/i);
   if(m) id=m[1];
   return { source, id };
 }
 // escaner profundo: busca precio/titulo/peso/moq en cualquier JSON sin depender del formato del proveedor
 function deepScan(obj){
-  const out={prices:[],titles:[],weights:[],moqs:[],images:[],descs:[],supplier:null,years:null,verified:null,unit:null,currency:null}, seen=new Set();
+  const out={prices:[],titles:[],weights:[],weightsSpec:[],moqs:[],images:[],descs:[],attributes:[],supplier:null,years:null,verified:null,unit:null,currency:null}, seen=new Set();
   (function walk(o){
     if(!o||typeof o!=='object'||seen.has(o))return; seen.add(o);
+    // par nombre/valor (tabla de caracteristicas: "Peso bruto" -> "0.430 kg")
+    var nm=o.name||o.attrName||o.attr_name||o.key||o.label||o.propName||o.propertyName||o.attribute;
+    var pv=(o.value!==undefined)?o.value:(o.attrValue!==undefined?o.attrValue:(o.val!==undefined?o.val:o.attributeValue));
+    if(typeof nm==='string' && (typeof pv==='string'||typeof pv==='number')){
+      var vs=String(pv), nl=nm.toLowerCase();
+      if(out.attributes.length<40 && vs.length<120) out.attributes.push({name:nm,value:vs});
+      if(/(peso\s*bruto|gross\s*weight|package\s*weight|net\s*weight|^peso$|^weight$|weight)/.test(nl)){
+        var mm=vs.replace(',','.').match(/([\d.]+)\s*(kg|kilo|g|gram|gr)?/i);
+        if(mm){ var n=parseFloat(mm[1]), un=(mm[2]||'').toLowerCase();
+          if(!isNaN(n)&&n>0){ var kg=(un==='g'||un==='gram'||un==='gr')?n/1000:(un==='kg'||un==='kilo')?n:(n>50?n/1000:n); if(kg>0&&kg<1000)out.weightsSpec.push(kg); } }
+      }
+    }
     for(const k in o){ const v=o[k], key=k.toLowerCase();
       if(v&&typeof v==='object'){ walk(v); continue; }
       const isP=/(price|saleprice|app_sale_price|target_sale_price|min_?price|amount)/.test(key);
@@ -126,7 +138,7 @@ function deepScan(obj){
         if(isP){ const m=v.replace(/,/g,'').match(/\d+(?:\.\d+)?/); if(m){const n=parseFloat(m[0]); if(n>0&&n<100000)out.prices.push(n);} }
         else if(isW){ const m=v.match(/\d+(?:\.\d+)?/); if(m){const n=parseFloat(m[0]); if(n>0&&n<100000)out.weights.push(n);} }
         else if(isM){ const m=v.match(/\d+/); if(m)out.moqs.push(parseInt(m[0],10)); }
-        else if(/(title|subject|product_?name|^name$)/.test(key)&&v.length>8&&v.length<200&&out.titles.length<6)out.titles.push(v);
+        else if(/(title|subject|product_?name|^name$)/.test(key)&&v.length>12&&v.length<200&&out.titles.length<6)out.titles.push(v);
         else if(/(image|img|pic|photo)/.test(key)&&/^(https?:)?\/\//.test(v)&&out.images.length<8)out.images.push(v.indexOf('//')===0?'https:'+v:v);
         else if(/(desc|detail|description)/.test(key)&&v.length>20&&v.length<2000&&out.descs.length<3)out.descs.push(v);
         else if(/(company|store|seller|shop|supplier)/.test(key)&&/name/.test(key)&&!out.supplier&&v.length<120)out.supplier=v;
@@ -143,12 +155,12 @@ function pack(o){
   return Object.assign({ url:null,source:'Proveedor',productId:null,name:null,description:null,images:[],currency:'USD',
     priceMin:null,priceMax:null,unitPriceUSD:null,minimumOrderQuantity:null,unit:'piece',variants:[],
     supplier:{name:null,verified:null,years:null,country:'China'},shipping:{available:true,estimatedCostUSD:null},
-    weightKg:null,category:'otro',confidence:0,method:'estimate',note:'' }, o);
+    weightKg:null,category:'otro',attributes:[],confidence:0,method:'estimate',note:'' }, o);
 }
 // API estructurada (RapidAPI) configurable por env (pones la URL con {id})
 async function tryRapidApi(url, source, id){
   const key=process.env.RAPIDAPI_KEY; if(!key||!id) return null;
-  let tpl = /aliexpress/i.test(source)?process.env.RAPIDAPI_ALIEXPRESS_URL : /alibaba/i.test(source)?process.env.RAPIDAPI_ALIBABA_URL : (process.env.RAPIDAPI_ALIEXPRESS_URL||process.env.RAPIDAPI_ALIBABA_URL);
+  let tpl = /aliexpress/i.test(source)?process.env.RAPIDAPI_ALIEXPRESS_URL : /alibaba|1688/i.test(source)?process.env.RAPIDAPI_ALIBABA_URL : null;
   if(!tpl) return null;
   const base=tpl.replace('{id}',encodeURIComponent(id));
   const cands=[base]; const mEp=base.match(/(item_detail|item_sku)(_\d)?/);
@@ -166,9 +178,10 @@ async function tryRapidApi(url, source, id){
       if(!sc.prices.length&&!sc.titles.length) continue;
       let pmin=sc.prices.length?Math.min(...sc.prices):null, pmax=sc.prices.length?Math.max(...sc.prices):null;
       if(sc.currency&&/CNY|RMB/i.test(sc.currency)){ if(pmin)pmin=+(pmin/RMB_USD).toFixed(2); if(pmax)pmax=+(pmax/RMB_USD).toFixed(2); }
-      return { name:sc.titles[0]||null, priceMin:pmin, priceMax:pmax, price:pmin, weightKg:sc.weights[0]||null,
+      var realW=sc.weightsSpec.length?Math.min(...sc.weightsSpec):(sc.weights[0]||null);
+      return { name:sc.titles[0]||null, priceMin:pmin, priceMax:pmax, price:pmin, weightKg:realW, weightReal:!!sc.weightsSpec.length,
         moq:sc.moqs.length?Math.min(...sc.moqs):null, currency:sc.currency||'USD',
-        images:sc.images, description:sc.descs[0]||null, supplierName:sc.supplier, years:sc.years, verified:sc.verified, unit:sc.unit,
+        images:sc.images, description:sc.descs[0]||null, attributes:sc.attributes, supplierName:sc.supplier, years:sc.years, verified:sc.verified, unit:sc.unit,
         status:r.status, host, endpoint:apiUrl.split('?')[0].split('/').pop() };
     }catch(e){ lastSample=lastSample||e.message; } finally{ clearTimeout(t); }
   }
@@ -188,9 +201,10 @@ async function analyzeCore(url){
           currency:api.currency||'USD', priceMin:api.priceMin, priceMax:api.priceMax,
           unitPriceUSD:(api.price>0?+api.price.toFixed(2):CATS[cat].ep), minimumOrderQuantity:api.moq||null, unit:api.unit||'piece',
           supplier:{ name:api.supplierName||null, verified:api.verified, years:api.years||null, country:'China' },
+          attributes:api.attributes||[],
           weightKg:(api.weightKg>0?api.weightKg:CATS[cat].w), category:cat,
           confidence:(api.price&&api.name?0.9:0.6), method:'api',
-          note:'lectura via API ('+(api.endpoint||'item')+')'+(api.weightKg>0?'':' - peso estimado por categoria') }), debug };
+          note:'lectura via API ('+(api.endpoint||'item')+')'+(api.weightReal?' - peso real del anuncio':(api.weightKg>0?'':' - peso estimado por categoria')) }), debug };
       }
     } else debug.layers.push({rapidapi:'sin-config'});
   }catch(e){ debug.layers.push({rapidapi_err:e.message}); }
@@ -252,12 +266,13 @@ app.post('/api/lead', async (req,res)=>{
   const p = req.body || {};
   console.log('LEAD recibido', p.ref, (p.cliente||{}).nombre);  // queda en los logs de Render aunque el correo falle
   const cli=p.cliente||{}, tot=p.totales||{}, env=p.envio||{};
-  const prods=(p.productos||[]).map(x=>`• ${x.nombre} — ${x.cantidad} uds @ US$${x.usd_unidad}/u (${x.categoria})${x.estimado?' [estimado '+x.fuente+']':''}${x.link?'<br>&nbsp;&nbsp;&#128279; '+x.link:''}`).join('<br>');
+  const prods=(p.productos||[]).map(x=>`• ${x.nombre} — ${x.cantidad} uds @ US$${x.usd_unidad}/u (${x.categoria})${x.estimado?' [estimado '+x.fuente+']':''}${x.link?'<br>&nbsp;&nbsp;&#128279; '+x.link:''}${(x.atributos&&x.atributos.length)?'<br>&nbsp;&nbsp;<small>'+x.atributos.slice(0,14).map(a=>a.name+': '+a.value).join(' &middot; ')+'</small>':''}`).join('<br><br>');
   const html=`<h2>Nueva cotizacion Trendo — ${p.ref||''}</h2>
     <p><b>Perfil:</b> ${p.perfil||'-'}</p>
     <p><b>Cliente:</b> ${cli.nombre||'-'} · <b>WhatsApp:</b> ${cli.whatsapp||'-'} · <b>Email:</b> ${cli.email||'-'}<br>
        <b>Ciudad:</b> ${cli.ciudad||'-'} · <b>Empresa:</b> ${cli.empresa||'-'}</p>
     <p><b>Productos:</b><br>${prods||'-'}</p>
+    <p><b>&#128279; Links para revisar (tal cual los pego el cliente):</b><br>${(p.productos||[]).filter(x=>x.link).map(x=>'<a href="'+x.link+'">'+x.link+'</a>').join('<br>')||'(ninguno; productos ingresados manualmente)'}</p>
     <p><b>Envio:</b> ${env.modo} / ${env.regimen} · <b>Entrega:</b> ${env.entrega} · <b>TRM:</b> ${env.trm}</p>
     <p><b>Subtotal:</b> ${tot.subtotal_cop} · <b>Comision 7%:</b> ${tot.comision_protipark_7_cop} · <b>TOTAL:</b> ${tot.total_puesto_cop} · <b>/u:</b> ${tot.por_unidad_cop}</p>
     <p><b>Calificacion:</b> ${p.calificacion||'-'} · <b>Comentario:</b> ${p.comentario||'-'}</p>
