@@ -112,15 +112,18 @@ function deepScan(obj){
     if(!o||typeof o!=='object'||seen.has(o))return; seen.add(o);
     for(const k in o){ const v=o[k], key=k.toLowerCase();
       if(v&&typeof v==='object'){ walk(v); continue; }
-      if(typeof v==='number'||(typeof v==='string'&&/^[\d.,]+$/.test(v))){
-        const num=parseFloat(String(v).replace(/,/g,''));
-        if(!isNaN(num)){
-          if(/(price|saleprice|app_sale_price|target_sale_price|min_?price|amount)/.test(key)&&num>0&&num<100000)out.prices.push(num);
-          if(/(weight|gross_?weight|package_?weight)/.test(key)&&num>0&&num<100000)out.weights.push(num);
-          if(/(moq|min_?order|min_?quantity)/.test(key)&&num>0)out.moqs.push(num);
-        }
+      const isP=/(price|saleprice|app_sale_price|target_sale_price|min_?price|amount)/.test(key);
+      const isW=/(weight|gross_?weight|package_?weight)/.test(key);
+      const isM=/(moq|min_?order|min_?quantity)/.test(key);
+      if(typeof v==='number'){
+        if(isP&&v>0&&v<100000)out.prices.push(v);
+        if(isW&&v>0&&v<100000)out.weights.push(v);
+        if(isM&&v>0)out.moqs.push(v);
       } else if(typeof v==='string'){
-        if(/(title|subject|product_?name|^name$)/.test(key)&&v.length>8&&v.length<200&&out.titles.length<5)out.titles.push(v);
+        if(isP){ const m=v.replace(/,/g,'').match(/\d+(?:\.\d+)?/); if(m){const n=parseFloat(m[0]); if(n>0&&n<100000)out.prices.push(n);} }
+        else if(isW){ const m=v.match(/\d+(?:\.\d+)?/); if(m){const n=parseFloat(m[0]); if(n>0&&n<100000)out.weights.push(n);} }
+        else if(isM){ const m=v.match(/\d+/); if(m)out.moqs.push(parseInt(m[0],10)); }
+        else if(/(title|subject|product_?name|^name$)/.test(key)&&v.length>8&&v.length<200&&out.titles.length<5)out.titles.push(v);
         if(/currency/.test(key)&&/^[A-Z]{3}$/.test(v)&&!out.currency)out.currency=v;
       }
     }
@@ -143,11 +146,13 @@ async function tryRapidApi(url, source, id){
   const ctrl=new AbortController(), t=setTimeout(()=>ctrl.abort(),15000);
   try{
     const r=await fetch(apiUrl,{signal:ctrl.signal,headers:{'X-RapidAPI-Key':key,'X-RapidAPI-Host':host}});
-    const j=await r.json(); const sc=deepScan(j);
-    if(!sc.prices.length&&!sc.titles.length) return {_empty:true,host};
+    const txt=await r.text(); let j;
+    try{ j=JSON.parse(txt); }catch(e){ return {_error:'respuesta no-JSON', status:r.status, sample:txt.slice(0,400), host}; }
+    const sc=deepScan(j);
+    if(!sc.prices.length&&!sc.titles.length) return {_empty:true, status:r.status, sample:JSON.stringify(j).slice(0,500), host};
     let pmin=sc.prices.length?Math.min(...sc.prices):null, pmax=sc.prices.length?Math.max(...sc.prices):null;
     if(sc.currency&&/CNY|RMB/i.test(sc.currency)){ if(pmin)pmin=+(pmin/RMB_USD).toFixed(2); if(pmax)pmax=+(pmax/RMB_USD).toFixed(2); }
-    return {name:sc.titles[0]||null,priceMin:pmin,priceMax:pmax,price:pmin,weightKg:sc.weights[0]||null,moq:sc.moqs.length?Math.min(...sc.moqs):null,currency:sc.currency||'USD',host};
+    return {name:sc.titles[0]||null,priceMin:pmin,priceMax:pmax,price:pmin,weightKg:sc.weights[0]||null,moq:sc.moqs.length?Math.min(...sc.moqs):null,currency:sc.currency||'USD',status:r.status,host};
   }catch(e){ return {_error:e.message,host}; } finally{ clearTimeout(t); }
 }
 
@@ -156,7 +161,7 @@ async function analyzeCore(url){
   const u=url.toLowerCase(); const debug={ id, source, layers:[] };
   try{
     const api=await tryRapidApi(url,source,id);
-    if(api){ debug.layers.push({rapidapi:{found:!!(api.name||api.price),error:api._error,empty:api._empty,host:api.host}});
+    if(api){ debug.layers.push({rapidapi:{found:!!(api.name||api.price),error:api._error,empty:api._empty,status:api.status,host:api.host,sample:api.sample}});
       if(api.name||api.price){
         const cat=detectCat(((api.name||'')+' '+u).toLowerCase());
         return { ok:true, method:'api', data: pack({ url, source, productId:id,
