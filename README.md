@@ -118,3 +118,30 @@ Si el 587 tambien da timeout, Render esta bloqueando SMTP. Usa Resend, que envia
 5. Guarda y abre `/api/test-mail` → debe decir `"via":"resend"` y `ok:true`.
 
 El backend ya soporta ambos: si `RESEND_API_KEY` esta puesta, usa Resend; si no, usa el SMTP.
+
+---
+
+## 8. Lectura real del link — cascada (API -> scraper -> estimacion)
+
+`/api/analyze` ahora intenta, en orden:
+1. **API estructurada (RapidAPI)** -> JSON con precio, MOQ, titulo. `method:"api"`, la mas confiable.
+2. **ScraperAPI** (renderiza la pagina y busca el precio en el JSON interno) -> `method:"scraper"`.
+3. **Estimacion heuristica** por categoria -> `method:"estimate"` (lo que veias antes).
+
+La respuesta trae un campo `debug.layers` que dice que paso en cada capa (util para calibrar) y `data.confidence` (0 a 1).
+
+### Variables (Render -> Environment)
+- `RAPIDAPI_KEY` = tu key de RapidAPI.
+- `RAPIDAPI_ALIEXPRESS_URL` = URL de la API de AliExpress con `{id}` (ej. `https://aliexpress-datahub.p.rapidapi.com/item_detail?itemId={id}`).
+- `RAPIDAPI_ALIBABA_URL` = URL de la API de Alibaba con `{id}` (segun la API a la que te suscribas).
+- `SCRAPER_API_KEY` = (opcional) key de scraperapi.com para la capa 2.
+
+El backend extrae solo el `id` del producto del link (el numero largo del URL) y arma la llamada.
+
+### Como elegir las APIs en RapidAPI
+- AliExpress: busca "AliExpress DataHub" o "AliExpress true API" (devuelven detalle por itemId). Suelen tener plan free.
+- Alibaba: busca "Alibaba product" / "Alibaba scraper". Alibaba es mas dificil; si una no sirve, probamos otra.
+Cuando tengas una key y la URL puestas, prueba con tu link y **pasame el `debug` que devuelve** `/api/analyze`; con esa respuesta real afino el mapeo de campos (cada API nombra distinto el precio).
+
+### Nota sobre el peso
+Casi ninguna API trae el peso real, y un mismo anuncio tiene varias medidas. Por eso el `weightKg` suele venir estimado por categoria. El paso fino es leer las **variantes** y que el cliente elija medida; lo agregamos cuando definas las APIs.

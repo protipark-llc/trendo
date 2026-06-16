@@ -98,33 +98,102 @@ app.get('/api/test-mail', async (_q,res)=>{
   }catch(e){ console.error('test-mail ERROR', e.message); res.status(500).json({ ok:false, error:e.message }); }
 });
 
-app.post('/api/analyze', async (req,res)=>{
-  const { url } = req.body || {};
-  if(!url) return res.status(400).json({ ok:false, error:'falta url' });
+// extrae source + id de producto del URL (Alibaba .../_1601455645588.html, AliExpress /item/100500xxx.html, etc.)
+function extractInfo(url){
+  const source = detectSrc(url.toLowerCase());
+  let id=null, m = url.match(/(\d{8,})\.html/) || url.match(/\/(\d{8,})(?:[\/?\.]|$)/) || url.match(/[?&](?:id|itemId|productId)=(\d{6,})/i);
+  if(m) id=m[1];
+  return { source, id };
+}
+// escaner profundo: busca precio/titulo/peso/moq en cualquier JSON sin depender del formato del proveedor
+function deepScan(obj){
+  const out={prices:[],titles:[],weights:[],moqs:[],currency:null}, seen=new Set();
+  (function walk(o){
+    if(!o||typeof o!=='object'||seen.has(o))return; seen.add(o);
+    for(const k in o){ const v=o[k], key=k.toLowerCase();
+      if(v&&typeof v==='object'){ walk(v); continue; }
+      if(typeof v==='number'||(typeof v==='string'&&/^[\d.,]+$/.test(v))){
+        const num=parseFloat(String(v).replace(/,/g,''));
+        if(!isNaN(num)){
+          if(/(price|saleprice|app_sale_price|target_sale_price|min_?price|amount)/.test(key)&&num>0&&num<100000)out.prices.push(num);
+          if(/(weight|gross_?weight|package_?weight)/.test(key)&&num>0&&num<100000)out.weights.push(num);
+          if(/(moq|min_?order|min_?quantity)/.test(key)&&num>0)out.moqs.push(num);
+        }
+      } else if(typeof v==='string'){
+        if(/(title|subject|product_?name|^name$)/.test(key)&&v.length>8&&v.length<200&&out.titles.length<5)out.titles.push(v);
+        if(/currency/.test(key)&&/^[A-Z]{3}$/.test(v)&&!out.currency)out.currency=v;
+      }
+    }
+  })(obj);
+  return out;
+}
+// rellena el contrato completo con defaults
+function pack(o){
+  return Object.assign({ url:null,source:'Proveedor',productId:null,name:null,description:null,images:[],currency:'USD',
+    priceMin:null,priceMax:null,unitPriceUSD:null,minimumOrderQuantity:null,unit:'piece',variants:[],
+    supplier:{name:null,verified:null,years:null,country:'China'},shipping:{available:true,estimatedCostUSD:null},
+    weightKg:null,category:'otro',confidence:0,method:'estimate',note:'' }, o);
+}
+// API estructurada (RapidAPI) configurable por env (pones la URL con {id})
+async function tryRapidApi(url, source, id){
+  const key=process.env.RAPIDAPI_KEY; if(!key||!id) return null;
+  let tpl = /aliexpress/i.test(source)?process.env.RAPIDAPI_ALIEXPRESS_URL : /alibaba/i.test(source)?process.env.RAPIDAPI_ALIBABA_URL : (process.env.RAPIDAPI_ALIEXPRESS_URL||process.env.RAPIDAPI_ALIBABA_URL);
+  if(!tpl) return null;
+  const apiUrl=tpl.replace('{id}',encodeURIComponent(id)), host=new URL(apiUrl).host;
+  const ctrl=new AbortController(), t=setTimeout(()=>ctrl.abort(),15000);
+  try{
+    const r=await fetch(apiUrl,{signal:ctrl.signal,headers:{'X-RapidAPI-Key':key,'X-RapidAPI-Host':host}});
+    const j=await r.json(); const sc=deepScan(j);
+    if(!sc.prices.length&&!sc.titles.length) return {_empty:true,host};
+    let pmin=sc.prices.length?Math.min(...sc.prices):null, pmax=sc.prices.length?Math.max(...sc.prices):null;
+    if(sc.currency&&/CNY|RMB/i.test(sc.currency)){ if(pmin)pmin=+(pmin/RMB_USD).toFixed(2); if(pmax)pmax=+(pmax/RMB_USD).toFixed(2); }
+    return {name:sc.titles[0]||null,priceMin:pmin,priceMax:pmax,price:pmin,weightKg:sc.weights[0]||null,moq:sc.moqs.length?Math.min(...sc.moqs):null,currency:sc.currency||'USD',host};
+  }catch(e){ return {_error:e.message,host}; } finally{ clearTimeout(t); }
+}
+
+async function analyzeCore(url){
+  const { source, id } = extractInfo(url);
+  const u=url.toLowerCase(); const debug={ id, source, layers:[] };
+  try{
+    const api=await tryRapidApi(url,source,id);
+    if(api){ debug.layers.push({rapidapi:{found:!!(api.name||api.price),error:api._error,empty:api._empty,host:api.host}});
+      if(api.name||api.price){
+        const cat=detectCat(((api.name||'')+' '+u).toLowerCase());
+        return { ok:true, method:'api', data: pack({ url, source, productId:id,
+          name:(api.name||source+' / '+CATS[cat].name).slice(0,90), currency:api.currency||'USD',
+          priceMin:api.priceMin, priceMax:api.priceMax, unitPriceUSD:(api.price>0?+api.price.toFixed(2):CATS[cat].ep),
+          minimumOrderQuantity:api.moq||null, weightKg:(api.weightKg>0?api.weightKg:CATS[cat].w), category:cat,
+          confidence:(api.price&&api.name?0.85:0.6), method:'api',
+          note:'lectura via API de producto'+(api.weightKg>0?'':' (peso estimado por categoria)') }), debug };
+      }
+    } else debug.layers.push({rapidapi:'sin-config'});
+  }catch(e){ debug.layers.push({rapidapi_err:e.message}); }
   try{
     const { status, html, rendered } = await fetchHtml(url);
-    const $ = cheerio.load(html);
-    const u = url.toLowerCase();
-    const title = ($('meta[property="og:title"]').attr('content') || $('title').text() || '').trim().replace(/\s+/g,' ');
-    const cat = detectCat((title+' '+u).toLowerCase());
-    const src = detectSrc(u);
-    let price = parsePrice($, html);
-    const isRMB = /¥|￥|CNY|RMB|元/i.test(html) && !/US\s?\$|USD/i.test(html);
-    if(price && isRMB) price = +(price/RMB_USD).toFixed(2);
-    const blocked = /captcha|verify|robot|punish|slide to verify/i.test(html) || status>=400;
-    if(!price || price<=0 || price>5000) price = CATS[cat].ep;
-    const data = {
-      name: title ? title.slice(0,80) : (src+' / '+CATS[cat].name),
-      source: src, unitPriceUSD: price, weightKg: CATS[cat].w, category: cat,
-      note: blocked ? 'el sitio bloqueo la lectura; estimacion' : (rendered ? 'lectura renderizada (a confirmar)' : 'lectura parcial (a confirmar)')
-    };
-    console.log('analyze', src, cat, price, 'blocked='+blocked, 'rendered='+rendered);
-    res.json({ ok:true, data, debug:{ status, rendered, blocked } });
+    const $=cheerio.load(html);
+    const title=($('meta[property="og:title"]').attr('content')||$('title').text()||'').trim().replace(/\s+/g,' ');
+    let price=parsePrice($,html);
+    if(!price){ const blobs=html.match(/\{[^<]{200,}\}/g)||[]; for(const bl of blobs.slice(0,40)){ try{ const sc=deepScan(JSON.parse(bl)); if(sc.prices.length){ price=Math.min(...sc.prices); break; } }catch(e){} } }
+    const isRMB=/¥|￥|CNY|RMB|元/i.test(html)&&!/US\s?\$|USD/i.test(html); if(price&&isRMB)price=+(price/RMB_USD).toFixed(2);
+    const blocked=/captcha|verify|robot|punish|slide to verify|unusual traffic/i.test(html)||status>=400;
+    const cat=detectCat((title+' '+u).toLowerCase());
+    debug.layers.push({scraper:{rendered,status,blocked,gotTitle:!!title,gotPrice:!!price}});
+    const had=!!price; if(!price||price<=0||price>5000)price=CATS[cat].ep;
+    return { ok:true, method:'scraper', data: pack({ url, source, productId:id,
+      name:title?title.slice(0,90):(source+' / '+CATS[cat].name), unitPriceUSD:price,
+      priceMin:had?price:null, priceMax:had?price:null, weightKg:CATS[cat].w, category:cat,
+      confidence: blocked?0.3:(had?0.6:0.4), method:'scraper',
+      note: blocked?'el sitio bloqueo la lectura; estimacion':(rendered?'lectura renderizada (a confirmar)':'lectura parcial (a confirmar)') }), debug };
   }catch(e){
-    console.error('analyze ERROR', e.message);
-    res.json({ ok:true, data: heuristic(url), warning: e.message });
+    debug.layers.push({scraper_err:e.message});
+    const h=heuristic(url);
+    return { ok:true, method:'estimate', warning:'Informacion estimada; requiere confirmacion',
+      data: pack({ url, source, productId:id, name:h.name, unitPriceUSD:h.unitPriceUSD, priceMin:h.unitPriceUSD, priceMax:h.unitPriceUSD,
+        weightKg:h.weightKg, category:h.category, confidence:0.25, method:'estimate', note:h.note }), debug };
   }
-});
+}
+app.post('/api/analyze', async (req,res)=>{ const { url }=req.body||{}; if(!url) return res.status(400).json({ ok:false, error:'falta url' }); res.json(await analyzeCore(url)); });
+app.get('/api/analyze-test', async (req,res)=>{ const url=req.query.url; if(!url) return res.status(400).json({ ok:false, error:'falta ?url= (pega el link codificado)' }); res.json(await analyzeCore(url)); });
 
 let transporter=null;
 function mailer(){
