@@ -86,7 +86,7 @@ function parsePrice($, html){
   return null;
 }
 
-app.get('/api/health', (_q,res)=> res.json({ ok:true, service:'trendo-backend', emailVia: process.env.RESEND_API_KEY?'resend':'smtp', scraper: !!process.env.SCRAPER_API_KEY, mailTo: MAIL_TO }));
+app.get('/api/health', (_q,res)=> res.json({ ok:true, service:'trendo-backend', version:'v2-multiendpoint', emailVia: process.env.RESEND_API_KEY?'resend':'smtp', scraper: !!process.env.SCRAPER_API_KEY, mailTo: MAIL_TO }));
 
 app.get('/api/test-mail', async (_q,res)=>{
   try{
@@ -107,7 +107,7 @@ function extractInfo(url){
 }
 // escaner profundo: busca precio/titulo/peso/moq en cualquier JSON sin depender del formato del proveedor
 function deepScan(obj){
-  const out={prices:[],titles:[],weights:[],moqs:[],currency:null}, seen=new Set();
+  const out={prices:[],titles:[],weights:[],moqs:[],images:[],descs:[],supplier:null,years:null,verified:null,unit:null,currency:null}, seen=new Set();
   (function walk(o){
     if(!o||typeof o!=='object'||seen.has(o))return; seen.add(o);
     for(const k in o){ const v=o[k], key=k.toLowerCase();
@@ -117,14 +117,22 @@ function deepScan(obj){
       const isM=/(moq|min_?order|min_?quantity)/.test(key);
       if(typeof v==='number'){
         if(isP&&v>0&&v<100000)out.prices.push(v);
-        if(isW&&v>0&&v<100000)out.weights.push(v);
-        if(isM&&v>0)out.moqs.push(v);
+        else if(isW&&v>0&&v<100000)out.weights.push(v);
+        else if(isM&&v>0)out.moqs.push(v);
+        else if(/(year|years|established)/.test(key)&&v>0&&v<100&&out.years==null)out.years=v;
+      } else if(typeof v==='boolean'){
+        if(/(verified|tradeassurance|goldsupplier|vip)/.test(key)&&out.verified===null)out.verified=v;
       } else if(typeof v==='string'){
         if(isP){ const m=v.replace(/,/g,'').match(/\d+(?:\.\d+)?/); if(m){const n=parseFloat(m[0]); if(n>0&&n<100000)out.prices.push(n);} }
         else if(isW){ const m=v.match(/\d+(?:\.\d+)?/); if(m){const n=parseFloat(m[0]); if(n>0&&n<100000)out.weights.push(n);} }
         else if(isM){ const m=v.match(/\d+/); if(m)out.moqs.push(parseInt(m[0],10)); }
-        else if(/(title|subject|product_?name|^name$)/.test(key)&&v.length>8&&v.length<200&&out.titles.length<5)out.titles.push(v);
+        else if(/(title|subject|product_?name|^name$)/.test(key)&&v.length>8&&v.length<200&&out.titles.length<6)out.titles.push(v);
+        else if(/(image|img|pic|photo)/.test(key)&&/^(https?:)?\/\//.test(v)&&out.images.length<8)out.images.push(v.indexOf('//')===0?'https:'+v:v);
+        else if(/(desc|detail|description)/.test(key)&&v.length>20&&v.length<2000&&out.descs.length<3)out.descs.push(v);
+        else if(/(company|store|seller|shop|supplier)/.test(key)&&/name/.test(key)&&!out.supplier&&v.length<120)out.supplier=v;
+        else if(/(^unit$|saleunit|sale_unit)/.test(key)&&v.length<20&&!out.unit&&/[a-z]/i.test(v))out.unit=v;
         if(/currency/.test(key)&&/^[A-Z]{3}$/.test(v)&&!out.currency)out.currency=v;
+        if(/(verified|tradeassurance|goldsupplier)/.test(key)&&/^(yes|true|1)$/i.test(v)&&out.verified===null)out.verified=true;
       }
     }
   })(obj);
@@ -142,18 +150,29 @@ async function tryRapidApi(url, source, id){
   const key=process.env.RAPIDAPI_KEY; if(!key||!id) return null;
   let tpl = /aliexpress/i.test(source)?process.env.RAPIDAPI_ALIEXPRESS_URL : /alibaba/i.test(source)?process.env.RAPIDAPI_ALIBABA_URL : (process.env.RAPIDAPI_ALIEXPRESS_URL||process.env.RAPIDAPI_ALIBABA_URL);
   if(!tpl) return null;
-  const apiUrl=tpl.replace('{id}',encodeURIComponent(id)), host=new URL(apiUrl).host;
-  const ctrl=new AbortController(), t=setTimeout(()=>ctrl.abort(),15000);
-  try{
-    const r=await fetch(apiUrl,{signal:ctrl.signal,headers:{'X-RapidAPI-Key':key,'X-RapidAPI-Host':host}});
-    const txt=await r.text(); let j;
-    try{ j=JSON.parse(txt); }catch(e){ return {_error:'respuesta no-JSON', status:r.status, sample:txt.slice(0,400), host}; }
-    const sc=deepScan(j);
-    if(!sc.prices.length&&!sc.titles.length) return {_empty:true, status:r.status, sample:JSON.stringify(j).slice(0,500), host};
-    let pmin=sc.prices.length?Math.min(...sc.prices):null, pmax=sc.prices.length?Math.max(...sc.prices):null;
-    if(sc.currency&&/CNY|RMB/i.test(sc.currency)){ if(pmin)pmin=+(pmin/RMB_USD).toFixed(2); if(pmax)pmax=+(pmax/RMB_USD).toFixed(2); }
-    return {name:sc.titles[0]||null,priceMin:pmin,priceMax:pmax,price:pmin,weightKg:sc.weights[0]||null,moq:sc.moqs.length?Math.min(...sc.moqs):null,currency:sc.currency||'USD',status:r.status,host};
-  }catch(e){ return {_error:e.message,host}; } finally{ clearTimeout(t); }
+  const base=tpl.replace('{id}',encodeURIComponent(id));
+  const cands=[base]; const mEp=base.match(/(item_detail|item_sku)(_\d)?/);
+  if(mEp){ const ep=mEp[1]; for(let i=2;i<=6;i++){ const alt=base.replace(/(item_detail|item_sku)(_\d)?/, ep+'_'+i); if(cands.indexOf(alt)<0)cands.push(alt); } }
+  let lastSample=null,lastStatus=null,host=null;
+  for(const apiUrl of cands){
+    host=new URL(apiUrl).host;
+    const ctrl=new AbortController(), t=setTimeout(()=>ctrl.abort(),15000);
+    try{
+      const r=await fetch(apiUrl,{signal:ctrl.signal,headers:{'X-RapidAPI-Key':key,'X-RapidAPI-Host':host}});
+      const txt=await r.text(); lastStatus=r.status; lastSample=txt.slice(0,500);
+      let j; try{ j=JSON.parse(txt); }catch(e){ continue; }
+      if(/"data":"error"|internal-error|temporarily unavailable|not subscribed|exceeded|quota/i.test(JSON.stringify(j))) continue;
+      const sc=deepScan(j);
+      if(!sc.prices.length&&!sc.titles.length) continue;
+      let pmin=sc.prices.length?Math.min(...sc.prices):null, pmax=sc.prices.length?Math.max(...sc.prices):null;
+      if(sc.currency&&/CNY|RMB/i.test(sc.currency)){ if(pmin)pmin=+(pmin/RMB_USD).toFixed(2); if(pmax)pmax=+(pmax/RMB_USD).toFixed(2); }
+      return { name:sc.titles[0]||null, priceMin:pmin, priceMax:pmax, price:pmin, weightKg:sc.weights[0]||null,
+        moq:sc.moqs.length?Math.min(...sc.moqs):null, currency:sc.currency||'USD',
+        images:sc.images, description:sc.descs[0]||null, supplierName:sc.supplier, years:sc.years, verified:sc.verified, unit:sc.unit,
+        status:r.status, host, endpoint:apiUrl.split('?')[0].split('/').pop() };
+    }catch(e){ lastSample=lastSample||e.message; } finally{ clearTimeout(t); }
+  }
+  return { _empty:true, status:lastStatus, sample:lastSample, host, triedAll:cands.length };
 }
 
 async function analyzeCore(url){
@@ -165,11 +184,13 @@ async function analyzeCore(url){
       if(api.name||api.price){
         const cat=detectCat(((api.name||'')+' '+u).toLowerCase());
         return { ok:true, method:'api', data: pack({ url, source, productId:id,
-          name:(api.name||source+' / '+CATS[cat].name).slice(0,90), currency:api.currency||'USD',
-          priceMin:api.priceMin, priceMax:api.priceMax, unitPriceUSD:(api.price>0?+api.price.toFixed(2):CATS[cat].ep),
-          minimumOrderQuantity:api.moq||null, weightKg:(api.weightKg>0?api.weightKg:CATS[cat].w), category:cat,
-          confidence:(api.price&&api.name?0.85:0.6), method:'api',
-          note:'lectura via API de producto'+(api.weightKg>0?'':' (peso estimado por categoria)') }), debug };
+          name:(api.name||source+' / '+CATS[cat].name).slice(0,120), description:api.description||null, images:api.images||[],
+          currency:api.currency||'USD', priceMin:api.priceMin, priceMax:api.priceMax,
+          unitPriceUSD:(api.price>0?+api.price.toFixed(2):CATS[cat].ep), minimumOrderQuantity:api.moq||null, unit:api.unit||'piece',
+          supplier:{ name:api.supplierName||null, verified:api.verified, years:api.years||null, country:'China' },
+          weightKg:(api.weightKg>0?api.weightKg:CATS[cat].w), category:cat,
+          confidence:(api.price&&api.name?0.9:0.6), method:'api',
+          note:'lectura via API ('+(api.endpoint||'item')+')'+(api.weightKg>0?'':' - peso estimado por categoria') }), debug };
       }
     } else debug.layers.push({rapidapi:'sin-config'});
   }catch(e){ debug.layers.push({rapidapi_err:e.message}); }
@@ -231,7 +252,7 @@ app.post('/api/lead', async (req,res)=>{
   const p = req.body || {};
   console.log('LEAD recibido', p.ref, (p.cliente||{}).nombre);  // queda en los logs de Render aunque el correo falle
   const cli=p.cliente||{}, tot=p.totales||{}, env=p.envio||{};
-  const prods=(p.productos||[]).map(x=>`• ${x.nombre} — ${x.cantidad} uds @ US$${x.usd_unidad}/u (${x.categoria})${x.estimado?' [estimado '+x.fuente+']':''}`).join('<br>');
+  const prods=(p.productos||[]).map(x=>`• ${x.nombre} — ${x.cantidad} uds @ US$${x.usd_unidad}/u (${x.categoria})${x.estimado?' [estimado '+x.fuente+']':''}${x.link?'<br>&nbsp;&nbsp;&#128279; '+x.link:''}`).join('<br>');
   const html=`<h2>Nueva cotizacion Trendo — ${p.ref||''}</h2>
     <p><b>Perfil:</b> ${p.perfil||'-'}</p>
     <p><b>Cliente:</b> ${cli.nombre||'-'} · <b>WhatsApp:</b> ${cli.whatsapp||'-'} · <b>Email:</b> ${cli.email||'-'}<br>
